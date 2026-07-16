@@ -3,22 +3,24 @@ name: PR Contract
 on:
   pull_request:
     types: [opened, synchronize]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 'PR number'
+        required: true
+      pr_title:
+        description: 'PR title'
+        required: false
+        default: ''
+      branch:
+        description: 'Head branch name'
+        required: false
+        default: ''
 
 permissions:
   contents: read
   pull-requests: write
   issues: write
-
-# ── Configuration ─────────────────────────────────────────────────────────────
-# Edit PROTECTED_PATHS to match the sensitive files in your repo.
-# PRs touching these paths get labeled tier:2 and require human review.
-# ──────────────────────────────────────────────────────────────────────────────
-env:
-  PROTECTED_PATHS: >-
-    supabase/migrations/
-    .github/workflows/
-    .github/CODEOWNERS
-    docker-compose
 
 jobs:
   pr-contract:
@@ -27,16 +29,17 @@ jobs:
       - name: Validate PR shape
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          PR_TITLE: ${{ github.event.pull_request.title }}
-          BRANCH: ${{ github.head_ref }}
+          PR_NUMBER: ${{ github.event.inputs.pr_number || github.event.pull_request.number }}
+          PR_TITLE: ${{ github.event.inputs.pr_title || github.event.pull_request.title }}
+          BRANCH: ${{ github.event.inputs.branch || github.head_ref }}
           GITHUB_REPOSITORY: ${{ github.repository }}
         run: |
           violations=""
 
-          # Lockfiles are auto-generated noise — exclude from size counts.
+          # Lockfiles are excluded from size counts — they are auto-generated noise.
           lockfile_pat="package-lock[.]json|yarn[.]lock|pnpm-lock[.]yaml|poetry[.]lock|Pipfile[.]lock|composer[.]lock|Gemfile[.]lock|go[.]sum"
 
+          # Use REST API only — gh pr * still probes local git even with -R.
           files_json=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER/files" --paginate)
           diff_lines=$(echo "$files_json" | jq --arg pat "$lockfile_pat" \
             '[.[] | select(.filename | test($pat) | not) | .additions + .deletions] | add // 0')
@@ -44,7 +47,7 @@ jobs:
             '[.[] | select(.filename | test($pat) | not)] | length')
 
           if [ "$diff_lines" -gt 700 ]; then
-            violations="${violations}\n- Diff is ${diff_lines} changed lines excluding lockfiles (limit: 700). Split this PR."
+            violations="${violations}\n- Diff is ${diff_lines} changed lines excluding lockfiles (limit: 700). Split this PR into smaller concerns."
           fi
 
           if [ "$file_count" -gt 15 ]; then
@@ -52,51 +55,61 @@ jobs:
           fi
 
           if ! echo "$BRANCH" | grep -qE '^[a-z][-a-z0-9]+/[a-z][-a-z0-9]+$'; then
-            violations="${violations}\n- Branch name \`${BRANCH}\` must match \`scope/slug\` (e.g. \`feat/add-login\`)."
+            violations="${violations}\n- Branch name \`${BRANCH}\` does not match \`scope/slug\` format (e.g. \`feat/add-login\`, \`fix/null-check\`)."
           fi
 
-          # Allows type: and type(scope): conventional commit formats
+          # Allow type: and type(scope): conventional commit formats
           if ! echo "$PR_TITLE" | grep -qE '^(feat|fix|chore|docs|refactor|test|ci|perf)(\([^)]+\))?:'; then
-            violations="${violations}\n- PR title must start with a conventional commit type (feat/fix/chore/docs/refactor/test/ci/perf), optionally with scope e.g. \`feat(auth):\`. Got: \"${PR_TITLE}\""
+            violations="${violations}\n- PR title must start with a conventional commit type. Allowed: feat/fix/chore/docs/refactor/test/ci/perf, optionally with scope e.g. \`ci(arcqa):\`. Got: \"${PR_TITLE}\""
           fi
 
-          # Tier detection — Tier 2 requires human review
-          changed_files=$(echo "$files_json" | jq -r '.[].filename' | tr '\n' ' ')
+          # K.52: determine approval tier
+          # Tier 2/3 files (from CODEOWNERS) require Charles's review
+          tier2_patterns="supabase/migrations/ litellm/config.yaml litellm/hooks/ .github/workflows/ .github/CODEOWNERS agents/.*IDENTITY agents/.*SOUL agents/_doctrine/ docs/roadmap.md scripts/sync_roadmap"
+          changed_files=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER/files" --paginate --jq '.[].filename' | tr '\n' ' ')
+
           tier=1
           tier_reason=""
-          for pattern in $PROTECTED_PATHS; do
+          for pattern in $tier2_patterns; do
             if echo "$changed_files" | grep -qE "$pattern"; then
               tier=2
-              tier_reason="Touches protected path matching \`$pattern\` (see CODEOWNERS)."
+              tier_reason="Touches CODEOWNERS-protected path matching \`$pattern\`."
               break
             fi
           done
           if [ "$diff_lines" -gt 400 ] && [ "$tier" -lt 2 ]; then
             tier=2
-            tier_reason="Diff is ${diff_lines} lines (> 400 Tier 1 threshold)."
+            tier_reason="Diff is ${diff_lines} lines (> 400 threshold for Tier 1)."
           fi
 
-          gh pr edit "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --add-label "tier:$tier" || true
+          # Apply tier label (gh pr edit handles the array correctly)
+          gh pr edit "$PR_NUMBER" \
+            --repo "$GITHUB_REPOSITORY" \
+            --add-label "tier:$tier" || true
 
           if [ "$tier" -ge 2 ]; then
-            gh api repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments \
-              -f body="**Tier $tier PR — human review required.**
+            tier_doc="https://github.com/$GITHUB_REPOSITORY/blob/main/docs/operations/pr-approval-tiers.md"
+            gh api \
+              repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments \
+              -f body="**Tier $tier PR - human review required.**
 
-          $tier_reason
+$tier_reason
 
-          Auto-merge is disabled. A team member with write access must approve before this can merge." \
+Auto-merge is disabled for this PR. @brubcha must approve before this can merge. See [PR approval tiers]($tier_doc) for details." \
               --method POST || true
           fi
 
           if [ -z "$violations" ]; then
-            echo "PR contract: all checks passed (Tier $tier)."
+            echo "PR contract: all checks passed. Tier: $tier"
             exit 0
           fi
 
-          gh api repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments \
+          gh api \
+            repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments \
             -f body="**PR Contract violations:**
           $(printf "$violations")
 
           Fix these before the PR can be merged." \
             --method POST
+
           exit 1
