@@ -2,24 +2,41 @@ name: e2e
 
 on:
   pull_request:
-    paths:
-      - 'surface/**'
-      - '.github/workflows/e2e.yml'
 
 permissions:
   contents: read
   issues: write
 
 jobs:
+  # This repo is the bare starter template — there's no app here until one is
+  # copied in per the README. Skip smoke tests cleanly instead of failing on
+  # a missing package.json.
+  probe:
+    runs-on: ubuntu-latest
+    outputs:
+      has_app: ${{ steps.check.outputs.present }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: check
+        run: |
+          if [ -f package.json ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "No package.json at repo root — nothing to build yet. Skipping smoke tests until an app is copied into this starter."
+          fi
+
   smoke:
-    name: Playwright smoke tests (Surface)
+    name: Playwright smoke tests
+    needs: probe
+    if: needs.probe.outputs.has_app == 'true'
     runs-on: ubuntu-latest
     # QA.A0: report only - does not block merges until QA.A1
     continue-on-error: true
 
     defaults:
       run:
-        working-directory: surface
+        working-directory: .   # Change this if your app is in a subdirectory (e.g. app/)
 
     steps:
       - uses: actions/checkout@v4
@@ -28,7 +45,7 @@ jobs:
         with:
           node-version: '20'
           cache: 'npm'
-          cache-dependency-path: surface/package-lock.json
+          cache-dependency-path: package-lock.json   # Update path if needed
 
       - name: Install dependencies
         run: npm ci
@@ -36,13 +53,13 @@ jobs:
       - name: Install Playwright browsers
         run: npx playwright install --with-deps chromium
 
-      - name: Build Surface app
+      - name: Build app
         run: npm run build
         env:
           NEXT_PUBLIC_SUPABASE_URL: ${{ secrets.NEXT_PUBLIC_SUPABASE_URL }}
           NEXT_PUBLIC_SUPABASE_ANON_KEY: ${{ secrets.NEXT_PUBLIC_SUPABASE_ANON_KEY }}
 
-      - name: Start Surface app
+      - name: Start app
         run: npm start &
         env:
           NEXT_PUBLIC_SUPABASE_URL: ${{ secrets.NEXT_PUBLIC_SUPABASE_URL }}
@@ -53,11 +70,11 @@ jobs:
 
       - name: Run smoke tests
         id: playwright
-        run: npx playwright test --reporter=json,html
+        run: npx playwright test --config=arcqa/playwright.config.ts --reporter=json,html
         env:
           BASE_URL: http://localhost:3000
           CI: true
-          E2E_SUPABASE_TOKEN: ${{ secrets.E2E_SUPABASE_TOKEN }}
+          E2E_SESSION_TOKEN: ${{ secrets.E2E_SESSION_TOKEN }}
           NEXT_PUBLIC_SUPABASE_URL: ${{ secrets.NEXT_PUBLIC_SUPABASE_URL }}
           NEXT_PUBLIC_SUPABASE_ANON_KEY: ${{ secrets.NEXT_PUBLIC_SUPABASE_ANON_KEY }}
 
@@ -66,12 +83,11 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: playwright-results
-          path: surface/test-results/
+          path: arcqa/test-results/
           retention-days: 14
 
       - name: Report failures as GitHub issues (QA.A5)
         if: failure() && github.event.pull_request.number != ''
-        working-directory: ${{ github.workspace }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
@@ -82,7 +98,7 @@ jobs:
           RUN_ID: ${{ github.run_id }}
         run: |
           python3 scripts/qa_issue_reporter.py \
-            --results surface/test-results/results.json \
+            --results arcqa/test-results/results.json \
             --pr-number "$PR_NUMBER" \
             --pr-title "$PR_TITLE" \
             --pr-author "$PR_AUTHOR" \
