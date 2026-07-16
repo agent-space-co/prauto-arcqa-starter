@@ -1,0 +1,36 @@
+name: WIP Check
+
+on:
+  pull_request:
+    types: [opened]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+# ── Configuration ─────────────────────────────────────────────────────────────
+# WIP_CAP: maximum number of open PRs before new ones are blocked.
+# Raise this if your team legitimately carries more concurrent work.
+# ──────────────────────────────────────────────────────────────────────────────
+env:
+  WIP_CAP: "25"
+
+jobs:
+  wip-check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Enforce WIP cap
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          count=$(gh api "repos/$GITHUB_REPOSITORY/pulls?state=open&per_page=100" --jq 'length')
+          if [ "$count" -gt "$WIP_CAP" ]; then
+            gh api \
+              repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments \
+              -f body="**WIP cap reached (${count}/${WIP_CAP} open PRs).** Close or merge existing PRs before opening new ones. The stale-sweep workflow closes PRs idle for 96h automatically." \
+              --method POST
+            exit 1
+          fi
+          echo "WIP: ${count}/${WIP_CAP} open PRs — within cap."

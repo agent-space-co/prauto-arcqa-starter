@@ -1,0 +1,60 @@
+name: auto-pr
+
+on:
+  push:
+    branches-ignore:
+      - main
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  open-pr:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Skip if PR already exists
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          existing=$(gh pr list --head "${{ github.ref_name }}" --json number --jq '.[0].number')
+          if [ -n "$existing" ]; then
+            echo "PR #$existing already exists — skipping."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create draft PR
+        if: steps.check.outputs.skip == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          branch="${{ github.ref_name }}"
+          scope=$(echo "$branch" | cut -d/ -f1)
+          slug=$(echo "$branch" | cut -d/ -f2- | tr '-' ' ')
+          title="${scope}: ${slug}"
+
+          body="## What\n\n<!-- Describe what changed and why -->\n\n## Test plan\n\n- [ ] Tested locally\n- [ ] CI passes"
+
+          gh pr create \
+            --base main \
+            --head "$branch" \
+            --title "$title" \
+            --body "$(printf "$body")" \
+            --draft
+
+      - name: Enable auto-merge
+        if: steps.check.outputs.skip == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          pr_number=$(gh pr list --head "${{ github.ref_name }}" --json number --jq '.[0].number')
+          if [ -n "$pr_number" ]; then
+            gh pr merge --auto --squash --delete-branch "$pr_number" || true
+          fi

@@ -1,0 +1,21 @@
+# CODEOWNERS — Tier 2 PR approval policy
+#
+# PRs touching files listed here require review from the named GitHub handle(s)
+# before they can merge. Edit the handles below to match your team.
+#
+# Run setup.sh to populate this file automatically.
+
+# Database migrations — irreversible schema changes
+supabase/migrations/         @YOUR_GITHUB_HANDLE
+
+# CI/CD — workflow changes affect the whole team
+.github/workflows/           @YOUR_GITHUB_HANDLE
+.github/CODEOWNERS           @YOUR_GITHUB_HANDLE
+
+# Infrastructure and secrets
+**/docker-compose*.yml       @YOUR_GITHUB_HANDLE
+**/.env.example              @YOUR_GITHUB_HANDLE
+
+# Add any other paths your team considers sensitive:
+# litellm/                   @YOUR_GITHUB_HANDLE
+# agents/*/IDENTITY.md       @YOUR_GITHUB_HANDLE

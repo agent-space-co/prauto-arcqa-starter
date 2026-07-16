@@ -1,0 +1,52 @@
+name: Lint Guard
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  lint-guard:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check for new lint suppressions
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          diff_output=$(gh api \
+            -H "Accept: application/vnd.github.diff" \
+            "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER")
+
+          suppressions=$(echo "$diff_output" | awk '
+            /^\+\+\+ b\// {
+              path = $0
+              sub(/^\+\+\+ b\//, "", path)
+              in_py = (path ~ /\.py$/)
+              next
+            }
+            in_py && /^\+/ && $0 !~ /^\+\+\+/ && /# noqa|# type: ignore/ { print }
+          ')
+
+          if [ -z "$suppressions" ]; then
+            echo "No new lint/type suppressions found."
+            exit 0
+          fi
+
+          count=$(echo "$suppressions" | wc -l)
+          lines_md=$(echo "$suppressions" | sed 's/^/`/' | sed 's/$/`/' | head -30)
+
+          gh api \
+            repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments \
+            -f body="**Lint Guard: $count new suppression(s) added**
+
+          This PR adds \`# noqa\` or \`# type: ignore\` comments. Either fix the underlying issue or add an inline comment explaining why the suppression is necessary.
+
+          Added suppressions:
+          $lines_md" \
+            --method POST
+
+          exit 1

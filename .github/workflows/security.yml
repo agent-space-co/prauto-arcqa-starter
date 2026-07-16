@@ -1,0 +1,66 @@
+name: Security Scan
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+jobs:
+  security:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install scanners
+        run: pip install pip-audit bandit
+
+      - name: pip-audit (dependency CVEs)
+        id: pip_audit
+        run: |
+          find . -name "requirements*.txt" | while read f; do
+            echo "Scanning $f"
+            pip-audit -r "$f" --format=json 2>/dev/null || true
+          done
+        continue-on-error: true
+
+      - name: bandit (code security)
+        id: bandit
+        run: |
+          bandit -r . \
+            --exclude "./.git,./node_modules,./venv,./.venv" \
+            -ll -f json \
+            -o bandit-report.json 2>/dev/null || true
+          if [ -f bandit-report.json ]; then
+            high=$(python3 -c "import json,sys; d=json.load(open('bandit-report.json')); print(len([r for r in d.get('results',[]) if r['issue_severity']=='HIGH']))")
+            echo "high_issues=$high" >> "$GITHUB_OUTPUT"
+          else
+            echo "high_issues=0" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create issue on failure
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          gh issue create \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "security: scan failed on PR #$PR_NUMBER" \
+            --body "Security scan failed on PR #$PR_NUMBER.
+
+**PR:** https://github.com/$GITHUB_REPOSITORY/pull/$PR_NUMBER
+**CI run:** $RUN_URL
+
+Review the scan output and resolve before merging." \
+            --label "security,needs-fix" \
+            --assignee "$PR_AUTHOR" || true
