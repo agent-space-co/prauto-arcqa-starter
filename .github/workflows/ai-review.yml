@@ -157,14 +157,30 @@ jobs:
               urllib.request.urlopen(req)
 
           if verdict == "approve":
-              post_comment(f"**AI review passed** - queuing auto-merge.\n\n{summary}")
-              subprocess.run([
+              merge_result = subprocess.run([
                   "gh", "pr", "merge", "--auto", "--squash", "--delete-branch",
-                  "--subject", f"auto-merge: {pr_title}",
                   "-R", repo,
                   pr_number,
-              ], check=False)
-              print("Verdict: approve - auto-merge queued.")
+              ], capture_output=True, text=True)
+              if merge_result.returncode == 0:
+                  post_comment(f"**AI review passed** - auto-merge enabled. Will merge when all required checks pass.\n\n{summary}")
+                  print("Verdict: approve - auto-merge enabled.")
+              else:
+                  err = (merge_result.stderr or merge_result.stdout or "").strip()
+                  err_lower = err.lower()
+                  if any(k in err_lower for k in ("review", "codeowner", "protected", "required", "rule")):
+                      post_comment(
+                          f"**AI review passed** - waiting for required human review.\n\n{summary}\n\n"
+                          f"_This PR touches CODEOWNERS-protected paths or requires human approval by policy. "
+                          f"Auto-merge will be queued once a reviewer approves._"
+                      )
+                      print(f"Verdict: approve - CODEOWNERS/policy block: {err[:200]}")
+                  else:
+                      post_comment(
+                          f"**AI review passed** but auto-merge could not be enabled.\n\n{summary}\n\n"
+                          f"Error: `{err[:200]}`\n\nPlease merge manually or investigate."
+                      )
+                      print(f"Verdict: approve - auto-merge failed unexpectedly: {err[:200]}")
               sys.exit(0)
 
           elif verdict == "request_changes":
