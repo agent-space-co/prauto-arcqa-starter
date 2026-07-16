@@ -163,71 +163,70 @@ jobs:
           # - lockfiles: always use main's version (canonical)
           # - all other files: keep main/HEAD version (stage :2:)
           cat > /tmp/resolve_conflicts.py << 'PYEOF'
-import subprocess, json, os, sys
+          import subprocess, json, os, sys
 
-LOCKFILES = {
-    'package-lock.json', 'yarn.lock', 'pnpm-lock.yaml',
-    'poetry.lock', 'Pipfile.lock', 'go.sum', 'Gemfile.lock',
-    'composer.lock',
-}
+          LOCKFILES = {
+              'package-lock.json', 'yarn.lock', 'pnpm-lock.yaml',
+              'poetry.lock', 'Pipfile.lock', 'go.sum', 'Gemfile.lock',
+              'composer.lock',
+          }
 
-def run(cmd):
-    return subprocess.run(cmd, capture_output=True, text=True)
+          def run(cmd):
+              return subprocess.run(cmd, capture_output=True, text=True)
 
-def get_stage(stage, path):
-    r = run(['git', 'show', f':{stage}:{path}'])
-    return r.stdout if r.returncode == 0 else None
+          def get_stage(stage, path):
+              r = run(['git', 'show', f':{stage}:{path}'])
+              return r.stdout if r.returncode == 0 else None
 
-def get_conflicts():
-    r = run(['git', 'diff', '--name-only', '--diff-filter=U'])
-    return [f for f in r.stdout.strip().split('\n') if f]
+          def get_conflicts():
+              r = run(['git', 'diff', '--name-only', '--diff-filter=U'])
+              return [f for f in r.stdout.strip().split('\n') if f]
 
-def resolve(path):
-    basename = os.path.basename(path)
-    ours = get_stage(2, path)   # main/HEAD side during rebase
-    if ours is None:
-        return False
+          def resolve(path):
+              basename = os.path.basename(path)
+              ours = get_stage(2, path)
+              if ours is None:
+                  return False
 
-    if basename == 'package.json':
-        try:
-            head_pkg = json.loads(ours)
-            theirs = get_stage(3, path)  # PR commit side
-            if theirs:
-                their_pkg = json.loads(theirs)
-                for key in ('dependencies', 'devDependencies', 'scripts', 'peerDependencies'):
-                    if key in their_pkg:
-                        for k, v in their_pkg[key].items():
-                            if k not in head_pkg.get(key, {}):
-                                head_pkg.setdefault(key, {})[k] = v
-            with open(path, 'w') as f:
-                json.dump(head_pkg, f, indent=2)
-                f.write('\n')
-            return True
-        except (json.JSONDecodeError, OSError):
-            return False
+              if basename == 'package.json':
+                  try:
+                      head_pkg = json.loads(ours)
+                      theirs = get_stage(3, path)
+                      if theirs:
+                          their_pkg = json.loads(theirs)
+                          for key in ('dependencies', 'devDependencies', 'scripts', 'peerDependencies'):
+                              if key in their_pkg:
+                                  for k, v in their_pkg[key].items():
+                                      if k not in head_pkg.get(key, {}):
+                                          head_pkg.setdefault(key, {})[k] = v
+                      with open(path, 'w') as f:
+                          json.dump(head_pkg, f, indent=2)
+                          f.write('\n')
+                      return True
+                  except (json.JSONDecodeError, OSError):
+                      return False
 
-    # Lockfiles and all other conflicts: keep main's version
-    try:
-        with open(path, 'w') as f:
-            f.write(ours)
-        return True
-    except OSError:
-        return False
+              try:
+                  with open(path, 'w') as f:
+                      f.write(ours)
+                  return True
+              except OSError:
+                  return False
 
-conflicts = get_conflicts()
-failed = []
-for path in conflicts:
-    if resolve(path):
-        subprocess.run(['git', 'add', path])
-        print(f'  resolved: {os.path.basename(path)} ({path})')
-    else:
-        failed.append(path)
-        print(f'  FAILED to resolve: {path}', file=sys.stderr)
+          conflicts = get_conflicts()
+          failed = []
+          for path in conflicts:
+              if resolve(path):
+                  subprocess.run(['git', 'add', path])
+                  print(f'  resolved: {os.path.basename(path)} ({path})')
+              else:
+                  failed.append(path)
+                  print(f'  FAILED to resolve: {path}', file=sys.stderr)
 
-if failed:
-    print(f'Unresolvable conflicts: {", ".join(failed)}', file=sys.stderr)
-    sys.exit(1)
-PYEOF
+          if failed:
+              print(f'Unresolvable conflicts: {", ".join(failed)}', file=sys.stderr)
+              sys.exit(1)
+          PYEOF
 
           success=false
           MAX=60
@@ -304,33 +303,35 @@ PYEOF
           CONFLICT_FILES: ${{ steps.rebase.outputs.conflict_files }}
         run: |
           pr_url="https://github.com/$GITHUB_REPOSITORY/pull/$PR_NUMBER"
+          body=$(cat << BODYEOF
+          PR #$PR_NUMBER has merge conflicts that could not be resolved automatically by the smart resolver.
+
+          **PR:** [$PR_TITLE]($pr_url)
+          **Branch:** \`$PR_BRANCH\`
+
+          **Conflicting files (smart resolver failed on these):**
+          \`\`\`
+          $CONFLICT_FILES
+          \`\`\`
+
+          Resolve manually:
+          \`\`\`bash
+          git checkout $PR_BRANCH
+          git fetch origin main
+          git rebase origin/main
+          git add .
+          git rebase --continue
+          git push --force-with-lease
+          \`\`\`
+          BODYEOF
+          )
           gh issue create \
             --repo "$GITHUB_REPOSITORY" \
             --title "merge-conflict: PR #$PR_NUMBER cannot auto-rebase - $PR_TITLE" \
-            --body "PR #$PR_NUMBER has merge conflicts that could not be resolved automatically by the smart resolver.
-
-**PR:** [$PR_TITLE]($pr_url)
-**Branch:** \`$PR_BRANCH\`
-
-**Conflicting files (smart resolver failed on these):**
-\`\`\`
-$CONFLICT_FILES
-\`\`\`
-
-Resolve manually:
-\`\`\`bash
-git checkout $PR_BRANCH
-git fetch origin main
-git rebase origin/main
-# fix conflicts, then:
-git add .
-git rebase --continue
-git push --force-with-lease
-\`\`\`" \
+            --body "$body" \
             --label "merge-conflict,needs-fix" \
             --assignee "$PR_AUTHOR" || true
 
-          # Also comment on the PR itself
           gh issue comment "$PR_NUMBER" \
             --repo "$GITHUB_REPOSITORY" \
             --body "**Merge conflict detected:** smart auto-rebase failed on conflicts that require human judgment. A tracking issue has been created. Resolve the conflicts manually and push." || true
