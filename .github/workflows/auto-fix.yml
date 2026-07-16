@@ -14,15 +14,18 @@ jobs:
   ruff-autofix:
     name: Auto-fix ruff violations
     runs-on: ubuntu-latest
+    # Only act on failures on non-main branches (i.e. PR branches)
     if: >
       github.event.workflow_run.conclusion == 'failure' &&
       github.event.workflow_run.head_branch != 'main'
+
     steps:
-      - name: Get PR for this workflow run
+      - name: Get PR number for this workflow run
         id: pr
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
           HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
         run: |
           pr_number=$(gh pr list \
@@ -34,9 +37,9 @@ jobs:
           echo "number=${pr_number}" >> "$GITHUB_OUTPUT"
           echo "branch=${HEAD_BRANCH}" >> "$GITHUB_OUTPUT"
 
-      - name: Skip if no open PR
+      - name: Skip if no open PR found
         if: steps.pr.outputs.number == ''
-        run: echo "No open PR for ${{ github.event.workflow_run.head_branch }} — skipping." && exit 0
+        run: echo "No open PR for branch ${{ github.event.workflow_run.head_branch }} - skipping." && exit 0
 
       - uses: actions/checkout@v4
         with:
@@ -46,7 +49,7 @@ jobs:
 
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
+          python-version: '3.11'
 
       - name: Install ruff
         run: pip install ruff
@@ -56,47 +59,57 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Apply safe auto-fixes and format
           ruff check --fix --unsafe-fixes . || true
           ruff format .
+
           if git diff --quiet; then
             echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "No ruff violations to auto-fix."
           else
             echo "changed=true" >> "$GITHUB_OUTPUT"
             git add -u
             git commit -m "chore: auto-fix ruff violations"
           fi
 
-      - name: Push fix
+      - name: Push auto-fix commit
         if: steps.fix.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: git push origin HEAD:${{ steps.pr.outputs.branch }}
 
-      - name: Comment — fix applied
+      - name: Comment on PR about auto-fix
         if: steps.fix.outputs.changed == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
           PR_NUMBER: ${{ steps.pr.outputs.number }}
         run: |
-          gh issue comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" \
-            --body "**Auto-fix applied:** ruff violations corrected and pushed. CI will re-run."
+          gh issue comment "$PR_NUMBER" \
+            --repo "$GITHUB_REPOSITORY" \
+            --body "**Auto-fix applied:** ruff violations were corrected automatically and pushed to this branch. CI will re-run now."
 
-      - name: Comment — nothing to fix
+      - name: Comment on PR if nothing to fix
         if: steps.fix.outputs.changed == 'false'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
           PR_NUMBER: ${{ steps.pr.outputs.number }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
           RUN_URL: ${{ github.event.workflow_run.html_url }}
         run: |
-          gh issue comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" \
-            --body "**Lint failed but ruff found nothing to auto-fix.** Manual attention required. [CI run]($RUN_URL)"
+          gh issue comment "$PR_NUMBER" \
+            --repo "$GITHUB_REPOSITORY" \
+            --body "**Lint failed but ruff found nothing to auto-fix.** The failure requires manual attention. [CI run]($RUN_URL)"
 
   conflict-detect:
-    name: Detect merge conflicts
+    name: Detect and auto-resolve merge conflicts
     runs-on: ubuntu-latest
     if: >
       github.event.workflow_run.conclusion == 'failure' &&
       github.event.workflow_run.head_branch != 'main'
+
     steps:
       - name: Get PR info
         id: pr
@@ -111,15 +124,19 @@ jobs:
             --state open \
             --json number,mergeable,title,user \
             --jq '.[0] // empty')
-          echo "number=$(echo "$pr_json" | jq -r '.number // empty')" >> "$GITHUB_OUTPUT"
-          echo "mergeable=$(echo "$pr_json" | jq -r '.mergeable // empty')" >> "$GITHUB_OUTPUT"
-          echo "title=$(echo "$pr_json" | jq -r '.title // empty')" >> "$GITHUB_OUTPUT"
-          echo "author=$(echo "$pr_json" | jq -r '.user.login // empty')" >> "$GITHUB_OUTPUT"
+          pr_number=$(echo "$pr_json" | jq -r '.number // empty')
+          mergeable=$(echo "$pr_json" | jq -r '.mergeable // empty')
+          pr_title=$(echo "$pr_json" | jq -r '.title // empty')
+          pr_author=$(echo "$pr_json" | jq -r '.user.login // empty')
+          echo "number=${pr_number}" >> "$GITHUB_OUTPUT"
+          echo "mergeable=${mergeable}" >> "$GITHUB_OUTPUT"
+          echo "title=${pr_title}" >> "$GITHUB_OUTPUT"
+          echo "author=${pr_author}" >> "$GITHUB_OUTPUT"
           echo "branch=${HEAD_BRANCH}" >> "$GITHUB_OUTPUT"
 
-      - name: Skip if no conflict
+      - name: Skip if no PR or no conflict
         if: steps.pr.outputs.number == '' || steps.pr.outputs.mergeable != 'CONFLICTING'
-        run: echo "No conflict detected — skipping."
+        run: echo "No conflict detected for this branch - skipping conflict handler."
 
       - uses: actions/checkout@v4
         if: steps.pr.outputs.mergeable == 'CONFLICTING'
@@ -128,38 +145,153 @@ jobs:
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Attempt auto-rebase
+      - uses: actions/setup-python@v5
+        if: steps.pr.outputs.mergeable == 'CONFLICTING'
+        with:
+          python-version: '3.11'
+
+      - name: Attempt smart auto-rebase
         id: rebase
         if: steps.pr.outputs.mergeable == 'CONFLICTING'
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git fetch origin main
-          if git rebase origin/main; then
+
+          # Smart conflict resolver:
+          # - package.json: merge deps from both sides (main base + PR unique additions)
+          # - lockfiles: always use main's version (canonical)
+          # - all other files: keep main/HEAD version (stage :2:)
+          cat > /tmp/resolve_conflicts.py << 'PYEOF'
+          import subprocess, json, os, sys
+
+          LOCKFILES = {
+              'package-lock.json', 'yarn.lock', 'pnpm-lock.yaml',
+              'poetry.lock', 'Pipfile.lock', 'go.sum', 'Gemfile.lock',
+              'composer.lock',
+          }
+
+          def run(cmd):
+              return subprocess.run(cmd, capture_output=True, text=True)
+
+          def get_stage(stage, path):
+              r = run(['git', 'show', f':{stage}:{path}'])
+              return r.stdout if r.returncode == 0 else None
+
+          def get_conflicts():
+              r = run(['git', 'diff', '--name-only', '--diff-filter=U'])
+              return [f for f in r.stdout.strip().split('\n') if f]
+
+          def resolve(path):
+              basename = os.path.basename(path)
+              ours = get_stage(2, path)
+              if ours is None:
+                  return False
+
+              if basename == 'package.json':
+                  try:
+                      head_pkg = json.loads(ours)
+                      theirs = get_stage(3, path)
+                      if theirs:
+                          their_pkg = json.loads(theirs)
+                          for key in ('dependencies', 'devDependencies', 'scripts', 'peerDependencies'):
+                              if key in their_pkg:
+                                  for k, v in their_pkg[key].items():
+                                      if k not in head_pkg.get(key, {}):
+                                          head_pkg.setdefault(key, {})[k] = v
+                      with open(path, 'w') as f:
+                          json.dump(head_pkg, f, indent=2)
+                          f.write('\n')
+                      return True
+                  except (json.JSONDecodeError, OSError):
+                      return False
+
+              try:
+                  with open(path, 'w') as f:
+                      f.write(ours)
+                  return True
+              except OSError:
+                  return False
+
+          conflicts = get_conflicts()
+          failed = []
+          for path in conflicts:
+              if resolve(path):
+                  subprocess.run(['git', 'add', path])
+                  print(f'  resolved: {os.path.basename(path)} ({path})')
+              else:
+                  failed.append(path)
+                  print(f'  FAILED to resolve: {path}', file=sys.stderr)
+
+          if failed:
+              print(f'Unresolvable conflicts: {", ".join(failed)}', file=sys.stderr)
+              sys.exit(1)
+          PYEOF
+
+          success=false
+          MAX=60
+          iter=0
+
+          git rebase origin/main && success=true
+
+          while [ "$success" = "false" ] && [ $iter -lt $MAX ]; do
+            iter=$((iter+1))
+
+            # Done if no rebase is in progress
+            if ! ([ -d .git/rebase-merge ] || [ -d .git/rebase-apply ]); then
+              success=true
+              break
+            fi
+
+            conflicts=$(git diff --name-only --diff-filter=U 2>/dev/null)
+
+            if [ -n "$conflicts" ]; then
+              if ! python3 /tmp/resolve_conflicts.py; then
+                git rebase --abort 2>/dev/null || true
+                break
+              fi
+            fi
+
+            output=$(GIT_EDITOR=true git rebase --continue 2>&1) && rc=$? || rc=$?
+
+            if echo "$output" | grep -q "Successfully rebased"; then
+              success=true
+              break
+            elif echo "$output" | grep -qE "nothing to commit|No changes"; then
+              git rebase --skip 2>/dev/null || true
+            fi
+            # If rc != 0, new conflicts appeared - next iteration resolves them
+          done
+
+          if [ "$success" = "true" ]; then
             echo "success=true" >> "$GITHUB_OUTPUT"
           else
-            git rebase --abort || true
+            git rebase --abort 2>/dev/null || true
             echo "success=false" >> "$GITHUB_OUTPUT"
+            conflict_files=$(git diff --name-only --diff-filter=U 2>/dev/null || echo "(unable to list)")
             echo "conflict_files<<EOF" >> "$GITHUB_OUTPUT"
-            git diff --name-only --diff-filter=U 2>/dev/null || echo "(unable to list)"
+            echo "$conflict_files" >> "$GITHUB_OUTPUT"
             echo "EOF" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Push resolved rebase
         if: steps.pr.outputs.mergeable == 'CONFLICTING' && steps.rebase.outputs.success == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: git push origin HEAD:${{ steps.pr.outputs.branch }} --force-with-lease
 
-      - name: Comment — rebase succeeded
+      - name: Comment on PR - rebase succeeded
         if: steps.pr.outputs.mergeable == 'CONFLICTING' && steps.rebase.outputs.success == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
           PR_NUMBER: ${{ steps.pr.outputs.number }}
         run: |
-          gh issue comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" \
-            --body "**Merge conflict auto-resolved:** rebased onto \`main\` and force-pushed. CI will re-run."
+          gh issue comment "$PR_NUMBER" \
+            --repo "$GITHUB_REPOSITORY" \
+            --body "**Merge conflict auto-resolved:** rebased onto \`main\` using smart merge (JSON-aware for package.json, canonical lockfile from main, HEAD kept for all other conflicts). Force-pushed - CI will re-run."
 
-      - name: Create issue — rebase failed
+      - name: Create issue - rebase failed (human required)
         if: steps.pr.outputs.mergeable == 'CONFLICTING' && steps.rebase.outputs.success == 'false'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -170,28 +302,36 @@ jobs:
           PR_BRANCH: ${{ steps.pr.outputs.branch }}
           CONFLICT_FILES: ${{ steps.rebase.outputs.conflict_files }}
         run: |
-          gh issue create --repo "$GITHUB_REPOSITORY" \
-            --title "merge-conflict: PR #$PR_NUMBER cannot auto-rebase" \
-            --body "PR #$PR_NUMBER has conflicts that could not be resolved automatically.
+          pr_url="https://github.com/$GITHUB_REPOSITORY/pull/$PR_NUMBER"
+          body=$(cat << BODYEOF
+          PR #$PR_NUMBER has merge conflicts that could not be resolved automatically by the smart resolver.
 
-**PR:** https://github.com/$GITHUB_REPOSITORY/pull/$PR_NUMBER
-**Branch:** \`$PR_BRANCH\`
+          **PR:** [$PR_TITLE]($pr_url)
+          **Branch:** \`$PR_BRANCH\`
 
-**Conflicting files:**
-\`\`\`
-$CONFLICT_FILES
-\`\`\`
+          **Conflicting files (smart resolver failed on these):**
+          \`\`\`
+          $CONFLICT_FILES
+          \`\`\`
 
-Resolve manually:
-\`\`\`bash
-git checkout $PR_BRANCH
-git fetch origin main
-git rebase origin/main
-git add .
-git rebase --continue
-git push --force-with-lease
-\`\`\`" \
-            --label "merge-conflict" \
+          Resolve manually:
+          \`\`\`bash
+          git checkout $PR_BRANCH
+          git fetch origin main
+          git rebase origin/main
+          git add .
+          git rebase --continue
+          git push --force-with-lease
+          \`\`\`
+          BODYEOF
+          )
+          gh issue create \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "merge-conflict: PR #$PR_NUMBER cannot auto-rebase - $PR_TITLE" \
+            --body "$body" \
+            --label "merge-conflict,needs-fix" \
             --assignee "$PR_AUTHOR" || true
-          gh issue comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" \
-            --body "**Merge conflict detected:** auto-rebase failed. A tracking issue has been created." || true
+
+          gh issue comment "$PR_NUMBER" \
+            --repo "$GITHUB_REPOSITORY" \
+            --body "**Merge conflict detected:** smart auto-rebase failed on conflicts that require human judgment. A tracking issue has been created. Resolve the conflicts manually and push." || true

@@ -24,7 +24,7 @@ jobs:
         run: |
           existing=$(gh pr list --head "${{ github.ref_name }}" --json number --jq '.[0].number')
           if [ -n "$existing" ]; then
-            echo "PR #$existing already exists — skipping."
+            echo "PR #$existing already exists for ${{ github.ref_name }} -- skipping"
             echo "skip=true" >> "$GITHUB_OUTPUT"
           else
             echo "skip=false" >> "$GITHUB_OUTPUT"
@@ -35,18 +35,18 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          # Derive a readable title from the branch name:
+          # feat/surface-pm-flows -> feat: surface pm flows
           branch="${{ github.ref_name }}"
           scope=$(echo "$branch" | cut -d/ -f1)
           slug=$(echo "$branch" | cut -d/ -f2- | tr '-' ' ')
           title="${scope}: ${slug}"
 
-          body="## What\n\n<!-- Describe what changed and why -->\n\n## Test plan\n\n- [ ] Tested locally\n- [ ] CI passes"
-
           gh pr create \
             --base main \
             --head "$branch" \
             --title "$title" \
-            --body "$(printf "$body")" \
+            --body "$(cat .github/pull_request_template.md)" \
             --draft
 
       - name: Enable auto-merge

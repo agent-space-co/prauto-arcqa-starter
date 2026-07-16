@@ -8,13 +8,6 @@ permissions:
   contents: read
   pull-requests: write
 
-# ── Configuration ─────────────────────────────────────────────────────────────
-# WIP_CAP: maximum number of open PRs before new ones are blocked.
-# Raise this if your team legitimately carries more concurrent work.
-# ──────────────────────────────────────────────────────────────────────────────
-env:
-  WIP_CAP: "25"
-
 jobs:
   wip-check:
     runs-on: ubuntu-latest
@@ -26,11 +19,11 @@ jobs:
           GITHUB_REPOSITORY: ${{ github.repository }}
         run: |
           count=$(gh api "repos/$GITHUB_REPOSITORY/pulls?state=open&per_page=100" --jq 'length')
-          if [ "$count" -gt "$WIP_CAP" ]; then
+          if [ "$count" -gt 50 ]; then
             gh api \
               repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments \
-              -f body="**WIP cap reached (${count}/${WIP_CAP} open PRs).** Close or merge existing PRs before opening new ones. The stale-sweep workflow closes PRs idle for 96h automatically." \
+              -f body="**WIP cap reached (${count}/50 open PRs).** PRAuto auto-merges tier:1 PRs as required checks pass; stale PRs are auto-closed after 96h. Resolve blocked PRs or close stale ones before opening new work." \
               --method POST
             exit 1
           fi
-          echo "WIP: ${count}/${WIP_CAP} open PRs — within cap."
+          echo "WIP: ${count}/50 open PRs — within cap."

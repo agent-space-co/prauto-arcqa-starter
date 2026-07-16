@@ -3,10 +3,24 @@ name: AI PR Review
 on:
   pull_request:
     types: [opened, synchronize, reopened]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 'PR number'
+        required: true
+      pr_title:
+        description: 'PR title'
+        required: false
+        default: ''
+      pr_author:
+        description: 'PR author login'
+        required: false
+        default: ''
 
 permissions:
   pull-requests: write
   contents: write
+  issues: write
 
 jobs:
   ai-review:
@@ -18,125 +32,222 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+          DISCORD_SCOUT_QUEUE_WEBHOOK: ${{ secrets.DISCORD_SCOUT_QUEUE_WEBHOOK }}
           GITHUB_REPOSITORY: ${{ github.repository }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_NUMBER: ${{ github.event.inputs.pr_number || github.event.pull_request.number }}
+          PR_TITLE: ${{ github.event.inputs.pr_title || github.event.pull_request.title }}
+          PR_AUTHOR: ${{ github.event.inputs.pr_author || github.event.pull_request.user.login }}
         run: |
           python3 - <<'PYEOF'
-          import os, json, subprocess, sys, urllib.request
+          import os
+          import json
+          import subprocess
+          import sys
+          import urllib.request
 
           pr_number = os.environ["PR_NUMBER"]
-          pr_title  = os.environ["PR_TITLE"]
-          anthropic_key  = os.environ.get("ANTHROPIC_API_KEY", "")
-          discord_webhook = os.environ.get("DISCORD_WEBHOOK", "")
-          repo     = os.environ.get("GITHUB_REPOSITORY", "")
+          pr_title = os.environ["PR_TITLE"]
+          anthropic_key = os.environ.get("ANTHROPIC_API_KEY", "")
+          discord_webhook = os.environ.get("DISCORD_SCOUT_QUEUE_WEBHOOK", "")
+          repo = os.environ.get("GITHUB_REPOSITORY", "")
           gh_token = os.environ["GH_TOKEN"]
 
+          # Get the PR diff via REST (avoids gh pr diff git-repo requirement)
           result = subprocess.run(
-              ["gh","api","-H","Accept: application/vnd.github.diff",
-               f"repos/{repo}/pulls/{pr_number}"],
-              capture_output=True, text=True)
+              [
+                  "gh", "api",
+                  "-H", "Accept: application/vnd.github.diff",
+                  f"repos/{repo}/pulls/{pr_number}",
+              ],
+              capture_output=True, text=True
+          )
           diff = result.stdout or ""
           diff_lines = len(diff.splitlines())
-          diff_truncated = diff[:8000] + ("\n... [truncated]" if len(diff) > 8000 else "")
 
-          prompt = f"""You are a code reviewer. Review this PR diff and return JSON only — no markdown, no prose.
+          # Truncate diff to 8000 chars for API call
+          diff_truncated = diff[:8000]
+          if len(diff) > 8000:
+              diff_truncated += "\n... [diff truncated at 8000 chars]"
 
-PR Title: {pr_title}
-Diff line count: {diff_lines}
+          prompt = f"""You are a code reviewer. Review this PR diff and return a JSON response only, no markdown, no prose, just valid JSON.
 
-Diff:
-```
-{diff_truncated}
-```
+          PR Title: {pr_title}
+          Diff line count: {diff_lines}
 
-Auto-flag as "request_changes" if added lines contain:
-- Hardcoded credentials, API keys, or secrets
-- eval(), exec(), subprocess with shell=True, pickle.loads()
-- SQL string concatenation (non-parameterized queries)
-- 0.0.0.0 binding without an explanatory comment
-- bare except: pass with no logging
+          PR Diff:
+          ```
+          {diff_truncated}
+          ```
 
-Auto-flag as "needs_human" if:
-- Diff touches auth middleware, JWT validation, or RLS policies
-- Diff line count exceeds 400
-- Diff modifies DB migrations AND application logic in the same PR
+          Rules - auto-flag as "request_changes" if any of these appear in added lines:
+          - 0.0.0.0 binding without an explanatory comment
+          - bare except: pass or except Exception: pass with no logging
+          - hardcoded credentials or API keys (sk-, passwords, tokens in string values)
+          - eval(), exec(), subprocess with shell=True, pickle.loads()
+          - SQL string concatenation (non-parameterized queries)
 
-Return exactly:
-{{"verdict": "approve|request_changes|needs_human", "findings": [], "summary": "one sentence"}}"""
+          Auto-flag as "needs_human" if:
+          - Diff touches auth middleware, RLS policies, or JWT validation
+          - Diff line count exceeds 400
+          - Diff modifies migration files AND application logic in the same PR
+          - Diff changes litellm/hooks/ files
+
+          Return exactly this JSON shape:
+          {{"verdict": "approve", "findings": [], "summary": "one sentence summary"}}
+
+          verdict must be one of: approve, request_changes, needs_human
+          If verdict is approve, findings may be empty. Be a pragmatic reviewer: do not block on style, only on real problems or the rules above."""
 
           verdict = "needs_human"
           findings = []
-          summary = "AI review failed — routing to human."
+          summary = "AI review failed to parse response, routing to human."
 
           if not anthropic_key:
-              summary = "ANTHROPIC_API_KEY not set — routing to human review."
+              summary = "ANTHROPIC_API_KEY not configured, routing to human review."
           else:
               payload = json.dumps({
                   "model": "claude-haiku-4-5-20251001",
                   "max_tokens": 1024,
                   "messages": [{"role": "user", "content": prompt}]
               }).encode()
+
               req = urllib.request.Request(
-                  "https://api.anthropic.com/v1/messages", data=payload,
-                  headers={"x-api-key": anthropic_key,
-                           "anthropic-version": "2023-06-01",
-                           "content-type": "application/json"},
-                  method="POST")
+                  "https://api.anthropic.com/v1/messages",
+                  data=payload,
+                  headers={
+                      "x-api-key": anthropic_key,
+                      "anthropic-version": "2023-06-01",
+                      "content-type": "application/json",
+                  },
+                  method="POST",
+              )
+
               try:
                   with urllib.request.urlopen(req, timeout=60) as resp:
                       body = json.loads(resp.read())
-                  raw = body["content"][0]["text"].strip().strip("```").strip()
-                  if raw.startswith("json"): raw = raw[4:]
-                  parsed  = json.loads(raw)
+                  raw_text = body["content"][0]["text"].strip()
+                  # Strip markdown code fences if present
+                  if raw_text.startswith("```"):
+                      lines = raw_text.splitlines()
+                      raw_text = "\n".join(lines[1:])
+                  if raw_text.endswith("```"):
+                      lines = raw_text.splitlines()
+                      raw_text = "\n".join(lines[:-1])
+                  parsed = json.loads(raw_text)
                   verdict = parsed.get("verdict", "needs_human")
                   findings = parsed.get("findings", [])
                   summary = parsed.get("summary", "")
               except Exception as e:
                   print(f"Claude API error: {e}", file=sys.stderr)
                   verdict = "needs_human"
-                  summary = f"AI review error ({type(e).__name__}) — routing to human."
+                  summary = f"AI review error ({type(e).__name__}), routing to human."
 
-          def post_comment(text):
-              payload = json.dumps({"body": text}).encode()
+          def post_comment(body_text):
+              payload = json.dumps({"body": body_text}).encode()
               req = urllib.request.Request(
                   f"https://api.github.com/repos/{repo}/issues/{pr_number}/comments",
                   data=payload,
-                  headers={"Authorization": f"Bearer {gh_token}",
-                           "Accept": "application/vnd.github+json",
-                           "Content-Type": "application/json"},
-                  method="POST")
+                  headers={
+                      "Authorization": f"Bearer {gh_token}",
+                      "Accept": "application/vnd.github+json",
+                      "Content-Type": "application/json",
+                  },
+                  method="POST",
+              )
               urllib.request.urlopen(req)
 
           if verdict == "approve":
-              post_comment(f"**AI review passed** — queuing auto-merge.\n\n{summary}")
-              subprocess.run([
-                  "gh","pr","merge","--auto","--squash","--delete-branch",
-                  "--subject", f"auto-merge: {pr_title}", "-R", repo, pr_number,
-              ], check=False)
-              print("Verdict: approve — auto-merge queued.")
+              merge_result = subprocess.run([
+                  "gh", "pr", "merge", "--auto", "--squash", "--delete-branch",
+                  "-R", repo,
+                  pr_number,
+              ], capture_output=True, text=True)
+              if merge_result.returncode == 0:
+                  post_comment(f"**AI review passed** - auto-merge enabled. Will merge when all required checks pass.\n\n{summary}")
+                  print("Verdict: approve - auto-merge enabled.")
+              else:
+                  err = (merge_result.stderr or merge_result.stdout or "").strip()
+                  err_lower = err.lower()
+                  if any(k in err_lower for k in ("review", "codeowner", "protected", "required", "rule")):
+                      post_comment(
+                          f"**AI review passed** - waiting for required human review.\n\n{summary}\n\n"
+                          f"_This PR touches CODEOWNERS-protected paths or requires human approval by policy. "
+                          f"Auto-merge will be queued once a reviewer approves._"
+                      )
+                      print(f"Verdict: approve - CODEOWNERS/policy block: {err[:200]}")
+                  else:
+                      post_comment(
+                          f"**AI review passed** but auto-merge could not be enabled.\n\n{summary}\n\n"
+                          f"Error: `{err[:200]}`\n\nPlease merge manually or investigate."
+                      )
+                      print(f"Verdict: approve - auto-merge failed unexpectedly: {err[:200]}")
               sys.exit(0)
 
           elif verdict == "request_changes":
-              findings_md = "\n".join(f"- {f}" for f in findings) or "- (see summary)"
-              post_comment(f"**AI review: changes requested**\n\n{summary}\n\n**Findings:**\n{findings_md}")
-              print("Verdict: request_changes.")
+              findings_md = "\n".join(f"- {f}" for f in findings) if findings else "- (no specific findings listed)"
+              post_comment(
+                  f"**AI review: changes requested**\n\n{summary}\n\n**Findings:**\n{findings_md}"
+              )
+              # K.50: create a tracked issue so the failure doesn't disappear into CI logs
+              pr_url = f"https://github.com/{repo}/pull/{pr_number}"
+              pr_author = os.environ.get("PR_AUTHOR", "")
+              run_url = f"https://github.com/{repo}/actions/runs/{os.environ.get('GITHUB_RUN_ID', '')}"
+              issue_body = (
+                  f"The AI reviewer requested changes on PR #{pr_number}.\n\n"
+                  f"**PR:** [{pr_title}]({pr_url})\n"
+                  f"**Summary:** {summary}\n\n"
+                  f"**Findings:**\n{findings_md}\n\n"
+                  f"**CI run:** {run_url}\n\n"
+                  f"_Resolve the findings and push a new commit to re-trigger the review._"
+              )
+              issue_payload = json.dumps({
+                  "title": f"ai-review: changes requested on PR #{pr_number} - {pr_title}",
+                  "body": issue_body,
+                  "labels": ["ai-review", "needs-fix"],
+                  **({"assignees": [pr_author]} if pr_author else {}),
+              }).encode()
+              try:
+                  ireq = urllib.request.Request(
+                      f"https://api.github.com/repos/{repo}/issues",
+                      data=issue_payload,
+                      headers={
+                          "Authorization": f"Bearer {gh_token}",
+                          "Accept": "application/vnd.github+json",
+                          "Content-Type": "application/json",
+                      },
+                      method="POST",
+                  )
+                  urllib.request.urlopen(ireq)
+              except Exception as e:
+                  print(f"Issue creation error (non-fatal): {e}", file=sys.stderr)
+              print("Verdict: request_changes - check failing.")
               sys.exit(1)
 
-          else:
+          else:  # needs_human
+              # Soft gate: comment + Discord escalate, but do not fail the check.
+              # Layer 3 human review is the merge gate (see docs/architecture/dora-flow-system.md).
               comment = f"**AI review: human review required**\n\n{summary}"
               if findings:
-                  comment += "\n\n**Notes:**\n" + "\n".join(f"- {f}" for f in findings)
+                  findings_md = "\n".join(f"- {f}" for f in findings)
+                  comment += f"\n\n**Notes:**\n{findings_md}"
               post_comment(comment)
+
               if discord_webhook:
                   pr_url = f"https://github.com/{repo}/pull/{pr_number}"
+                  discord_payload = json.dumps({
+                      "content": f"PR needs human review: **{pr_title}**\n{pr_url}\n_{summary}_"
+                  }).encode()
                   dreq = urllib.request.Request(
                       discord_webhook,
-                      data=json.dumps({"content": f"PR needs human review: **{pr_title}**\n{pr_url}\n_{summary}_"}).encode(),
-                      headers={"Content-Type": "application/json"}, method="POST")
-                  try: urllib.request.urlopen(dreq)
-                  except Exception as e: print(f"Discord error: {e}", file=sys.stderr)
-              print("Verdict: needs_human — escalated; check passes.")
+                      data=discord_payload,
+                      headers={"Content-Type": "application/json"},
+                      method="POST",
+                  )
+                  try:
+                      urllib.request.urlopen(dreq)
+                  except Exception as e:
+                      print(f"Discord webhook error: {e}", file=sys.stderr)
+
+              print("Verdict: needs_human - escalated; check passes for Layer 3 review.")
               sys.exit(0)
           PYEOF
