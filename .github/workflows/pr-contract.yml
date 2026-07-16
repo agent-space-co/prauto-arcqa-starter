@@ -3,6 +3,19 @@ name: PR Contract
 on:
   pull_request:
     types: [opened, synchronize]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 'PR number'
+        required: true
+      pr_title:
+        description: 'PR title'
+        required: false
+        default: ''
+      branch:
+        description: 'Head branch name'
+        required: false
+        default: ''
 
 permissions:
   contents: read
@@ -27,9 +40,9 @@ jobs:
       - name: Validate PR shape
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          PR_TITLE: ${{ github.event.pull_request.title }}
-          BRANCH: ${{ github.head_ref }}
+          PR_NUMBER: ${{ github.event.inputs.pr_number || github.event.pull_request.number }}
+          PR_TITLE: ${{ github.event.inputs.pr_title || github.event.pull_request.title }}
+          BRANCH: ${{ github.event.inputs.branch || github.head_ref }}
           GITHUB_REPOSITORY: ${{ github.repository }}
         run: |
           violations=""
