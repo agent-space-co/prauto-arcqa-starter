@@ -2,7 +2,7 @@ name: Stale PR Sweep
 
 on:
   schedule:
-    - cron: '0 14 * * *'   # 9am ET daily — adjust to your timezone
+    - cron: '0 14 * * *'   # 9am CDT (UTC-5) daily
   workflow_dispatch:
 
 permissions:
@@ -21,46 +21,82 @@ jobs:
             const STALE_LABEL = 'stale';
             const now = Date.now();
 
+            // Ensure stale label exists
             try {
               await github.rest.issues.createLabel({
-                owner: context.repo.owner, repo: context.repo.repo,
-                name: STALE_LABEL, color: 'e4e669',
-                description: 'PR open >48h without activity',
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                name: STALE_LABEL,
+                color: 'e4e669',
+                description: 'PR has been open more than 48 hours without activity',
               });
-            } catch (e) { /* already exists */ }
+            } catch (e) {
+              // Label already exists - fine
+            }
 
             const { data: prs } = await github.rest.pulls.list({
-              owner: context.repo.owner, repo: context.repo.repo,
-              state: 'open', per_page: 100,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              per_page: 100,
             });
 
-            let labeled = 0, closed = 0;
+            let labeled = 0;
+            let closed = 0;
+            let skipped = 0;
+
             for (const pr of prs) {
               const ageMs = now - new Date(pr.created_at).getTime();
               const hasStale = pr.labels.some(l => l.name === STALE_LABEL);
 
+              if (ageMs < MS_48H) {
+                skipped++;
+                continue;
+              }
+
               if (ageMs >= MS_96H && hasStale) {
-                await github.rest.pulls.update({
-                  owner: context.repo.owner, repo: context.repo.repo,
-                  pull_number: pr.number, state: 'closed',
-                });
+                // Close stale PR
                 await github.rest.issues.createComment({
-                  owner: context.repo.owner, repo: context.repo.repo,
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
                   issue_number: pr.number,
-                  body: `**Closed by stale-sweep** — open for 96h with no activity. Reopen if this work should continue.`,
+                  body: `**Stale PR closed automatically.** This PR was open for more than 96 hours after receiving a stale warning. Re-open and resolve the stale label if the work is still needed.`,
                 });
+                await github.rest.pulls.update({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  pull_number: pr.number,
+                  state: 'closed',
+                });
+                // K.50: create a tracking issue so the dropped work is visible
+                const prUrl = `https://github.com/${context.repo.owner}/${context.repo.repo}/pull/${pr.number}`;
+                await github.rest.issues.create({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  title: `stale: PR #${pr.number} closed - "${pr.title}"`,
+                  body: `PR #${pr.number} was automatically closed by the stale sweeper after 96 hours of inactivity.\n\n**PR:** [${pr.title}](${prUrl})\n**Branch:** \`${pr.head.ref}\`\n**Author:** @${pr.user.login}\n\nIf this work is still needed, re-open the PR or create a new one. Remove the \`stale\` label to reset the clock on the next attempt.`,
+                  labels: ['stale', 'needs-reopen'],
+                  assignees: [pr.user.login],
+                });
+                console.log(`Closed stale PR #${pr.number}: ${pr.title}`);
                 closed++;
               } else if (ageMs >= MS_48H && !hasStale) {
+                // Add stale label and warn
                 await github.rest.issues.addLabels({
-                  owner: context.repo.owner, repo: context.repo.repo,
-                  issue_number: pr.number, labels: [STALE_LABEL],
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: pr.number,
+                  labels: [STALE_LABEL],
                 });
                 await github.rest.issues.createComment({
-                  owner: context.repo.owner, repo: context.repo.repo,
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
                   issue_number: pr.number,
-                  body: `**Stale PR** — no activity for 48h. Will be closed in another 48h if there is no update. Push a commit or leave a comment to keep it open.`,
+                  body: `**Stale warning:** this PR has been open 48+ hours. It will be closed automatically after 96 hours if not merged or resolved. Remove the \`stale\` label to reset the clock.`,
                 });
+                console.log(`Labeled stale PR #${pr.number}: ${pr.title}`);
                 labeled++;
               }
             }
-            console.log(`stale-sweep: labeled=${labeled} closed=${closed}`);
+
+            console.log(`Stale sweep complete: ${labeled} labeled, ${closed} closed, ${skipped} too young.`);
