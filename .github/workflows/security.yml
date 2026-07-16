@@ -2,6 +2,11 @@ name: Security Scan
 
 on:
   pull_request:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 'PR number'
+        required: true
 
 permissions:
   contents: read
@@ -14,53 +19,131 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-
       - name: Install scanners
         run: pip install pip-audit bandit
 
-      - name: pip-audit (dependency CVEs)
-        id: pip_audit
+      - name: Collect changed files
+        id: changed
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.inputs.pr_number || github.event.pull_request.number }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
         run: |
-          find . -name "requirements*.txt" | while read f; do
-            echo "Scanning $f"
-            pip-audit -r "$f" --format=json 2>/dev/null || true
-          done
-        continue-on-error: true
+          files=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER/files" --paginate \
+            --jq '.[] | select(.status != "removed") | .filename')
 
-      - name: bandit (code security)
-        id: bandit
+          py_files=$(echo "$files" | grep '\.py$' || true)
+          req_files=$(echo "$files" | grep -E '(^|/)requirements[^/]*\.txt$' || true)
+
+          {
+            echo "py_files<<EOF"
+            echo "$py_files"
+            echo "EOF"
+            echo "req_files<<EOF"
+            echo "$req_files"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: pip-audit CVE scan
+        id: pip_audit
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.inputs.pr_number || github.event.pull_request.number }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          REQ_FILES: ${{ steps.changed.outputs.req_files }}
         run: |
-          bandit -r . \
-            --exclude "./.git,./node_modules,./venv,./.venv" \
-            -ll -f json \
-            -o bandit-report.json 2>/dev/null || true
-          if [ -f bandit-report.json ]; then
-            high=$(python3 -c "import json,sys; d=json.load(open('bandit-report.json')); print(len([r for r in d.get('results',[]) if r['issue_severity']=='HIGH']))")
-            echo "high_issues=$high" >> "$GITHUB_OUTPUT"
-          else
-            echo "high_issues=0" >> "$GITHUB_OUTPUT"
+          if [ -z "$REQ_FILES" ]; then
+            echo "No requirements*.txt files changed — skipping pip-audit."
+            exit 0
           fi
 
-      - name: Create issue on failure
+          audit_failed=0
+          audit_output=""
+          while IFS= read -r req; do
+            [ -z "$req" ] && continue
+            [ -f "$req" ] || continue
+            echo "Auditing $req"
+            if ! out=$(pip-audit -r "$req" 2>&1); then
+              audit_failed=1
+              audit_output="${audit_output}"$'\n'"### ${req}"$'\n'"${out}"$'\n'
+            else
+              echo "pip-audit clean: $req"
+            fi
+          done < <(printf '%s\n' "$REQ_FILES")
+
+          if [ "$audit_failed" -ne 0 ]; then
+            gh api \
+              repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments \
+              -f body="**pip-audit found vulnerabilities in changed requirements:**
+
+          \`\`\`
+          $audit_output
+          \`\`\`
+
+          Fix or pin the affected packages before merging." \
+              --method POST
+            exit 1
+          fi
+          echo "pip-audit: clean"
+
+      - name: bandit SAST scan
+        id: bandit
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.inputs.pr_number || github.event.pull_request.number }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          PY_FILES: ${{ steps.changed.outputs.py_files }}
+        run: |
+          if [ -z "$PY_FILES" ]; then
+            echo "No Python files changed — skipping bandit."
+            exit 0
+          fi
+
+          mapfile -t py_arr < <(printf '%s\n' "$PY_FILES")
+          existing=()
+          for f in "${py_arr[@]}"; do
+            [ -n "$f" ] && [ -f "$f" ] && existing+=("$f")
+          done
+          if [ ${#existing[@]} -eq 0 ]; then
+            echo "No existing Python files to scan — skipping bandit."
+            exit 0
+          fi
+
+          bandit_output=$(bandit -ll --format txt "${existing[@]}" 2>&1) || {
+            gh api \
+              repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments \
+              -f body="**bandit SAST scan found HIGH/MEDIUM severity issues in changed files:**
+
+          \`\`\`
+          $bandit_output
+          \`\`\`
+
+          Review and remediate before merging." \
+              --method POST
+            exit 1
+          }
+          echo "bandit: clean"
+
+      - name: Create issue on security failure
         if: failure()
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GITHUB_REPOSITORY: ${{ github.repository }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_NUMBER: ${{ github.event.inputs.pr_number || github.event.pull_request.number }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
           PR_AUTHOR: ${{ github.event.pull_request.user.login }}
-          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
         run: |
+          pr_url="https://github.com/$GITHUB_REPOSITORY/pull/$PR_NUMBER"
+          run_url="https://github.com/$GITHUB_REPOSITORY/actions/runs/$RUN_ID"
           gh issue create \
             --repo "$GITHUB_REPOSITORY" \
-            --title "security: scan failed on PR #$PR_NUMBER" \
-            --body "Security scan failed on PR #$PR_NUMBER.
+            --title "security: scan failure on PR #$PR_NUMBER - $PR_TITLE" \
+            --body "A security scan (pip-audit or bandit) failed on PR #$PR_NUMBER.
 
-**PR:** https://github.com/$GITHUB_REPOSITORY/pull/$PR_NUMBER
-**CI run:** $RUN_URL
+**PR:** [$PR_TITLE]($pr_url)
+**CI run:** $run_url
 
-Review the scan output and resolve before merging." \
+Review the scan output in the CI run and remediate before merging." \
             --label "security,needs-fix" \
             --assignee "$PR_AUTHOR" || true
