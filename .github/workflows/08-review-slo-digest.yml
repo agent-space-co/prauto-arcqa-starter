@@ -1,0 +1,96 @@
+# PRAUTO L3: Review SLOs + daily merge-health digest (PRAUTO-L3-11 / L3-12)
+# Hourly: escalate risk/high PRs with no human review inside the SLO window.
+# Daily: post a merge-health digest issue. Point WEBHOOK_URL at the Wire ingest
+# to route notifications into the Grid's channels.
+
+name: review-slo-digest
+
+on:
+  schedule:
+    - cron: "0 * * * *"     # hourly SLO check
+    - cron: "30 12 * * 1-5" # daily digest, 07:30 America/Chicago (12:30 UTC, CDT)
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+env:
+  SLO_HOURS_FIRST: 4
+  SLO_HOURS_ESCALATE: 8
+  WIP_LIMIT: 12
+
+jobs:
+  slo-check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Escalate overdue risk/high PRs
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          WIRE_WEBHOOK: ${{ secrets.WIRE_WEBHOOK_URL }}
+        run: |
+          set -euo pipefail
+          NOW=$(date -u +%s)
+
+          gh pr list --repo "$GITHUB_REPOSITORY" --state open --label "risk/high" \
+            --json number,createdAt,reviews,title --jq -c '.[]' | while read -r pr; do
+            NUM=$(echo "$pr" | jq -r '.number')
+            CREATED=$(echo "$pr" | jq -r '.createdAt')
+            HUMAN_REVIEWS=$(echo "$pr" | jq '[.reviews[] | select(.author.login | endswith("[bot]") | not)] | length')
+            [ "$HUMAN_REVIEWS" -gt 0 ] && continue
+
+            AGE_H=$(( (NOW - $(date -u -d "$CREATED" +%s)) / 3600 ))
+            TITLE=$(echo "$pr" | jq -r '.title')
+
+            if [ "$AGE_H" -ge "$SLO_HOURS_ESCALATE" ]; then
+              MSG="ESCALATION: PR #${NUM} (${TITLE}) risk/high, ${AGE_H}h with no human review. SLO ${SLO_HOURS_FIRST}h."
+            elif [ "$AGE_H" -ge "$SLO_HOURS_FIRST" ]; then
+              MSG="SLO breach: PR #${NUM} (${TITLE}) risk/high, ${AGE_H}h with no human review."
+            else
+              continue
+            fi
+
+            gh pr comment "$NUM" --repo "$GITHUB_REPOSITORY" --body "$MSG"
+            if [ -n "${WIRE_WEBHOOK:-}" ]; then
+              curl -sS -X POST "$WIRE_WEBHOOK" -H 'Content-Type: application/json' \
+                -d "$(jq -n --arg m "$MSG" --arg r "$GITHUB_REPOSITORY" '{source:"prauto-slo",repo:$r,message:$m}')" || true
+            fi
+          done
+
+  digest:
+    if: github.event.schedule == '30 12 * * 1-5' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Build and post merge-health digest
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          WIRE_WEBHOOK: ${{ secrets.WIRE_WEBHOOK_URL }}
+        run: |
+          set -euo pipefail
+
+          WAITING=$(gh pr list --repo "$GITHUB_REPOSITORY" --state open --label "risk/high" \
+            --json number,title,createdAt --jq 'map("- #\(.number) \(.title) (opened \(.createdAt))") | join("\n")')
+          NEEDS_HUMAN=$(gh pr list --repo "$GITHUB_REPOSITORY" --state open --label "needs-human" \
+            --json number,title --jq 'map("- #\(.number) \(.title) (auto-fix cap reached)") | join("\n")')
+          NEEDS_REBASE=$(gh pr list --repo "$GITHUB_REPOSITORY" --state open --label "needs-rebase" \
+            --json number,title --jq 'map("- #\(.number) \(.title)") | join("\n")')
+          OPEN_COUNT=$(gh pr list --repo "$GITHUB_REPOSITORY" --state open --json number --jq 'length')
+
+          WIP_NOTE=""
+          if [ "$OPEN_COUNT" -gt "$WIP_LIMIT" ]; then
+            WIP_NOTE="WIP LIMIT EXCEEDED: ${OPEN_COUNT} open PRs (limit ${WIP_LIMIT}). Pause new agent PRs until the queue drains (PRAUTO-L3-13)."
+          fi
+
+          BODY=$(printf "## Merge health digest\n\n%s\n\n### Waiting on human (risk/high)\n%s\n\n### Auto-fix escalations\n%s\n\n### Needs rebase\n%s\n\n### Open PRs: %s\n\nAgreement-rate trend and stage durations: see the ClickHouse dashboard (PRAUTO-L5-06)." \
+            "$WIP_NOTE" "${WAITING:-none}" "${NEEDS_HUMAN:-none}" "${NEEDS_REBASE:-none}" "$OPEN_COUNT")
+
+          gh api "repos/${GITHUB_REPOSITORY}/issues" \
+            -f title="Merge health digest $(date -u +%F)" \
+            -f body="$BODY" \
+            -f "labels[]=digest"
+
+          if [ -n "${WIRE_WEBHOOK:-}" ]; then
+            curl -sS -X POST "$WIRE_WEBHOOK" -H 'Content-Type: application/json' \
+              -d "$(jq -n --arg b "$BODY" --arg r "$GITHUB_REPOSITORY" '{source:"prauto-digest",repo:$r,message:$b}')" || true
+          fi

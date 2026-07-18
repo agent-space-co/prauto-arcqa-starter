@@ -1,0 +1,57 @@
+# PRAUTO Layer 3: Merge routing
+# Enables GitHub native auto-merge based on risk tier:
+#   risk/low    -> auto-merge armed immediately (still waits for required checks)
+#   risk/medium -> auto-merge armed only after ai-review/verdict succeeds
+#   risk/high   -> never armed; human approval via CODEOWNERS is the gate
+#
+# Auto-merge here means GitHub's native queue: the PR merges only when ALL
+# required status checks and required reviews on the ruleset are green.
+# This workflow arms it; the ruleset enforces it. PRAUTO-L3-07.
+
+name: automerge
+
+on:
+  pull_request_target:
+    types: [labeled, unlabeled]
+  status: {}
+  check_suite:
+    types: [completed]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  route:
+    if: github.event_name == 'pull_request_target'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Arm or disarm auto-merge by tier
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          LABELS=$(gh pr view "$PR" --repo "$GITHUB_REPOSITORY" --json labels --jq '.labels[].name')
+
+          if echo "$LABELS" | grep -qx 'risk/high'; then
+            gh pr merge "$PR" --repo "$GITHUB_REPOSITORY" --disable-auto 2>/dev/null || true
+            echo "risk/high: auto-merge disabled, human gate active"
+            exit 0
+          fi
+
+          if echo "$LABELS" | grep -qx 'risk/low'; then
+            gh pr merge "$PR" --repo "$GITHUB_REPOSITORY" --squash --auto
+            echo "risk/low: auto-merge armed"
+            exit 0
+          fi
+
+          if echo "$LABELS" | grep -qx 'risk/medium'; then
+            # Arm auto-merge; the ruleset requires ai-review/verdict to be green
+            # on this tier, so merge cannot happen until the AI approves.
+            gh pr merge "$PR" --repo "$GITHUB_REPOSITORY" --squash --auto
+            echo "risk/medium: auto-merge armed, gated on ai-review/verdict"
+            exit 0
+          fi
+
+          echo "No risk label yet; classifier has not run. No action."

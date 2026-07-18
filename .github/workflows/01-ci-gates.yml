@@ -1,0 +1,100 @@
+# PRAUTO Layer 1: Deterministic gates
+# Every job here should be listed as a required status check in the ruleset.
+# Runs on pull_request (not pull_request_target) for fork safety. PRAUTO-SEC-01.
+#
+# SETUP: If your app lives in a subdirectory (e.g. "web/", "app/"), add:
+#   defaults:
+#     run:
+#       working-directory: <your-subdir>
+# to each job below, and update the cache-dependency-path to match.
+
+name: ci-gates
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-gates-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: npm run lint
+
+  typecheck:
+    name: typecheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: npm test -- --ci
+
+  build:
+    name: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+
+  secret-scan:
+    name: secret-scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install gitleaks
+        run: |
+          GITLEAKS_VERSION=8.24.2
+          curl -sSL https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz \
+            | tar -xz
+          sudo mv gitleaks /usr/local/bin/gitleaks
+      - name: Run gitleaks
+        run: gitleaks git --redact --verbose --log-opts="origin/main..HEAD"
+
+  dep-audit:
+    name: dep-audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      # Blocks on high and critical only. Tune per repo.
+      - run: npm audit --audit-level=high

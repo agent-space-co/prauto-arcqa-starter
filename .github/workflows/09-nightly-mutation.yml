@@ -1,0 +1,57 @@
+# PRAUTO L7: Nightly mutation testing on critical paths (PRAUTO-L7-03)
+# Coverage percentage lies; mutation testing verifies the tests would actually
+# catch a bug. Runs nightly (never per-PR; too slow) on the security-critical
+# paths that the AI-approval tier depends on. Surviving mutants are filed as
+# issues. Example uses StrykerJS for TS/JS repos; swap the runner per stack.
+
+name: nightly-mutation
+
+on:
+  schedule:
+    - cron: "0 7 * * *"   # 02:00 America/Chicago (07:00 UTC, CDT)
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  mutate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+
+      - name: Run Stryker on critical paths
+        id: stryker
+        continue-on-error: true
+        run: |
+          npx stryker run \
+            --mutate "auth/**/*.ts,vault/**/*.ts,payments/**/*.ts" \
+            --reporters json,progress \
+            --thresholds.break 0 || true
+
+      - name: File issue for surviving mutants
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          REPORT="reports/mutation/mutation.json"
+          [ -f "$REPORT" ] || { echo "No report produced"; exit 0; }
+
+          SURVIVED=$(jq '[.files[].mutants[] | select(.status == "Survived")] | length' "$REPORT")
+          TOTAL=$(jq '[.files[].mutants[]] | length' "$REPORT")
+          [ "$SURVIVED" -eq 0 ] && { echo "All mutants killed"; exit 0; }
+
+          DETAILS=$(jq -r '[.files | to_entries[] | .key as $f | .value.mutants[] | select(.status=="Survived") | "- \($f):\(.location.start.line) \(.mutatorName)"] | .[0:30] | join("\n")' "$REPORT")
+
+          gh api "repos/${GITHUB_REPOSITORY}/issues" \
+            -f title="Mutation testing: ${SURVIVED}/${TOTAL} mutants survived on critical paths ($(date -u +%F))" \
+            -f body="$(printf "Surviving mutants indicate tests that would not catch these bugs. First 30:\n\n%s\n\nFull report in the workflow artifacts. PRAUTO-L7-03." "$DETAILS")" \
+            -f "labels[]=mutation-testing" \
+            -f "labels[]=risk/high"

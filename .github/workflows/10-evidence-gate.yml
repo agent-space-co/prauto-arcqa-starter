@@ -1,0 +1,64 @@
+# PRAUTO L0: Agent evidence gate (PRAUTO-L0-04)
+# Agent-authored PRs must carry an EVIDENCE block in the description before any
+# expensive review runs. Mirrors the QA factory handoff pattern: no artifact
+# ships without its verification record. Human-authored PRs are exempt.
+# Publishes status check "evidence/bundle" (add to required checks for repos
+# with agent authors).
+
+name: evidence-gate
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize]
+
+permissions:
+  contents: read
+  statuses: write
+  pull-requests: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate evidence bundle
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          AUTHOR: ${{ github.event.pull_request.user.login }}
+          BODY: ${{ github.event.pull_request.body }}
+          SHA: ${{ github.event.pull_request.head.sha }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+
+          # Agent authors: Grid agents open PRs via a bot identity or the
+          # agent naming convention. Adjust the pattern to the ArcCharter roster.
+          IS_AGENT=false
+          case "$AUTHOR" in
+            *"[bot]"|grid-agent-*|arc-*) IS_AGENT=true ;;
+          esac
+
+          if [ "$IS_AGENT" = false ]; then
+            gh api "repos/${GITHUB_REPOSITORY}/statuses/${SHA}" \
+              -f state=success -f context="evidence/bundle" \
+              -f description="Human author, evidence optional"
+            exit 0
+          fi
+
+          MISSING=""
+          echo "$BODY" | grep -q "### EVIDENCE"            || MISSING="$MISSING evidence-block"
+          echo "$BODY" | grep -qE "tests: *PASS"           || MISSING="$MISSING tests"
+          echo "$BODY" | grep -qE "rubric-self-check: *(PASS|FINDINGS-FIXED)" || MISSING="$MISSING rubric-self-check"
+          echo "$BODY" | grep -qE "smoke: *PASS"           || MISSING="$MISSING smoke"
+          echo "$BODY" | grep -qE "agent: *[A-Za-z0-9_-]+" || MISSING="$MISSING agent-id"
+
+          if [ -z "$MISSING" ]; then
+            gh api "repos/${GITHUB_REPOSITORY}/statuses/${SHA}" \
+              -f state=success -f context="evidence/bundle" \
+              -f description="Evidence bundle complete"
+          else
+            gh api "repos/${GITHUB_REPOSITORY}/statuses/${SHA}" \
+              -f state=failure -f context="evidence/bundle" \
+              -f description="Missing:${MISSING}"
+            gh pr comment "$PR" --repo "$GITHUB_REPOSITORY" --body \
+              "Evidence bundle incomplete (missing:${MISSING}). Agent PRs require the EVIDENCE block per GRID-HANDOFF-PRAUTO-001 section 12 before review runs."
+          fi

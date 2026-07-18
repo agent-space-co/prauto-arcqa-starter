@@ -1,0 +1,92 @@
+# PRAUTO Layer 3: Risk classification
+# Labels every PR risk/low, risk/medium, or risk/high based on:
+#   1. Paths touched (from .github/risk-paths.yml, human-owned config)
+#   2. PR size (escalates one tier over 400 changed lines)
+#   3. Author (dependency bots get the dep-specific path)
+#
+# Uses pull_request_target ONLY to gain label write permission on fork PRs.
+# It never checks out or executes PR code, so this is safe. PRAUTO-SEC guidance.
+
+name: risk-classifier
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  classify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout base branch config only
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.ref }}
+          sparse-checkout: |
+            .github/risk-paths.yml
+          sparse-checkout-cone-mode: false
+
+      - name: Classify
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR: ${{ github.event.pull_request.number }}
+          AUTHOR: ${{ github.event.pull_request.user.login }}
+          ADDITIONS: ${{ github.event.pull_request.additions }}
+          DELETIONS: ${{ github.event.pull_request.deletions }}
+        run: |
+          set -euo pipefail
+
+          # Pull changed file list via API; never executes PR code.
+          FILES=$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR}/files" --paginate --jq '.[].filename')
+
+          HIGH_PATTERNS=$(awk '/^high:/{f=1;next}/^[a-z]/{f=0}f' .github/risk-paths.yml | sed 's/^ *- *//' | grep -v '^$' || true)
+          LOW_PATTERNS=$(awk '/^low:/{f=1;next}/^[a-z]/{f=0}f' .github/risk-paths.yml | sed 's/^ *- *//' | grep -v '^$' || true)
+
+          TIER="medium"
+
+          # High wins if any file matches a high pattern
+          while IFS= read -r f; do
+            while IFS= read -r p; do
+              [ -z "$p" ] && continue
+              case "$f" in $p) TIER="high"; break 2 ;; esac
+            done <<< "$HIGH_PATTERNS"
+          done <<< "$FILES"
+
+          # Low only if ALL files match low patterns and tier not already high
+          if [ "$TIER" != "high" ]; then
+            ALL_LOW=true
+            while IFS= read -r f; do
+              MATCHED=false
+              while IFS= read -r p; do
+                [ -z "$p" ] && continue
+                case "$f" in $p) MATCHED=true; break ;; esac
+              done <<< "$LOW_PATTERNS"
+              [ "$MATCHED" = false ] && { ALL_LOW=false; break; }
+            done <<< "$FILES"
+            [ "$ALL_LOW" = true ] && TIER="low"
+          fi
+
+          # Dependency bots with lockfile/manifest-only changes stay low
+          case "$AUTHOR" in
+            renovate*|dependabot*) : ;; # tier already computed from paths
+          esac
+
+          # Size escalation: over 400 changed lines bumps low->medium, medium->high
+          TOTAL=$((ADDITIONS + DELETIONS))
+          if [ "$TOTAL" -gt 400 ]; then
+            case "$TIER" in
+              low) TIER="medium" ;;
+              medium) TIER="high" ;;
+            esac
+          fi
+
+          # Apply label, removing stale risk labels first
+          for L in risk/low risk/medium risk/high; do
+            gh api -X DELETE "repos/${GITHUB_REPOSITORY}/issues/${PR}/labels/$(python3 -c "import urllib.parse,sys;print(urllib.parse.quote('$L',safe=''))")" 2>/dev/null || true
+          done
+          gh api "repos/${GITHUB_REPOSITORY}/issues/${PR}/labels" -f "labels[]=risk/${TIER}"
+
+          echo "Classified PR #${PR} as risk/${TIER} (${TOTAL} lines changed)"

@@ -1,0 +1,39 @@
+# PRAUTO L3: Auto-rebase (PRAUTO-L3-10)
+# When main moves, update all open non-draft PRs so they stay continuously
+# mergeable. Uses GitHub's update-branch API (merge-update). PRs with conflicts
+# get a comment and a needs-rebase label instead.
+
+name: stale-rebase
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+jobs:
+  update-open-prs:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Update all open PRs against new main
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          PRS=$(gh pr list --repo "$GITHUB_REPOSITORY" --state open --json number,isDraft \
+            --jq '.[] | select(.isDraft == false) | .number')
+
+          for PR in $PRS; do
+            if gh api -X PUT "repos/${GITHUB_REPOSITORY}/pulls/${PR}/update-branch" 2>/dev/null; then
+              echo "PR #$PR updated"
+            else
+              # Likely a conflict; flag it instead of failing the run
+              gh api "repos/${GITHUB_REPOSITORY}/issues/${PR}/labels" -f "labels[]=needs-rebase" || true
+              gh pr comment "$PR" --repo "$GITHUB_REPOSITORY" \
+                --body "Auto-rebase failed (likely conflicts with main). Manual rebase needed." || true
+              echo "PR #$PR flagged needs-rebase"
+            fi
+          done
